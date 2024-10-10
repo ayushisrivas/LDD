@@ -1,3 +1,4 @@
+//pipe for IPC
 #include<stdio.h>
 #include<unistd.h>
 #include<string.h>
