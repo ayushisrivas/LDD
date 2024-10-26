@@ -1,209 +1,220 @@
-// [Previous code remains the same until process_recording function]
+#include <alsa/asoundlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <signal.h>
 
-int process_recording(const char *filename) {
-    printf("\n=== Processing Recording ===\n");
-    
-    // Open and check file
-    FILE *f = fopen(filename, "rb");
-    if (!f) {
-        printf("Error: Cannot open recorded file %s\n", filename);
-        return -1;
+#define RATE 44100
+#define CHANNELS 2
+#define SECONDS 5
+#define SAMPLE_SIZE (sizeof(short))
+#define FRAME_SIZE (CHANNELS * SAMPLE_SIZE)
+#define BUFFER_SIZE (RATE * SECONDS * FRAME_SIZE)
+#define PERIOD_SIZE 4096
+
+// Global volume control
+static float master_volume = 1.0f;
+
+// Function to handle ALSA xrun (under/overflow) recovery
+static int xrun_recovery(snd_pcm_t *handle, int err) {
+    if (err == -EPIPE) {    // under-run
+        err = snd_pcm_prepare(handle);
+        if (err < 0) {
+            fprintf(stderr, "Can't recover from underrun: %s\n", snd_strerror(err));
+            return err;
+        }
+    } else if (err == -ESTRPIPE) {    // system suspended
+        while ((err = snd_pcm_resume(handle)) == -EAGAIN)
+            sleep(1);
+        if (err < 0) {
+            err = snd_pcm_prepare(handle);
+            if (err < 0) {
+                fprintf(stderr, "Can't recover from suspend: %s\n", snd_strerror(err));
+                return err;
+            }
+        }
     }
+    return err;
+}
+
+// Function to safely write to PCM device
+static int write_pcm(snd_pcm_t *handle, short *buffer, snd_pcm_uframes_t frames) {
+    snd_pcm_uframes_t frames_left = frames;
+    short *buf = buffer;
     
-    // Get file size
-    fseek(f, 0, SEEK_END);
-    long file_size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    
-    printf("File size: %ld bytes\n", file_size);
-    
-    if (file_size == 0) {
-        printf("Error: Recording file is empty\n");
-        fclose(f);
-        return -1;
-    }
-    
-    // Allocate buffer with error checking
-    int16_t *buffer = malloc(file_size);
-    if (!buffer) {
-        printf("Error: Memory allocation failed\n");
-        fclose(f);
-        return -1;
-    }
-    
-    // Read file with verification
-    size_t read_size = fread(buffer, 1, file_size, f);
-    fclose(f);
-    
-    if (read_size != file_size) {
-        printf("Error: Could not read entire file. Read %zu of %ld bytes\n", read_size, file_size);
-        free(buffer);
-        return -1;
-    }
-    
-    printf("Successfully read %zu bytes from recording\n", read_size);
-    
-    // Analyze audio
-    AudioStats stats = analyze_audio(buffer, read_size / sizeof(int16_t));
-    
-    // Print analysis with error checking for invalid values
-    printf("\nAudio Analysis Results:\n");
-    if (stats.peak_amplitude > 0) {
-        printf("Peak Level: %.2f dB\n", 20 * log10(stats.peak_amplitude));
-        printf("Average Level: %.2f dB\n", 20 * log10(stats.average_amplitude));
-        printf("RMS Level: %.2f dB\n", 20 * log10(stats.rms_level));
-    } else {
-        printf("Warning: Invalid audio levels detected\n");
-    }
-    printf("Clipping Detected: %d instances\n", stats.clipping_count);
-    
-    // Save metadata with error checking
-    char metadata_filename[256];
-    snprintf(metadata_filename, sizeof(metadata_filename), "%s.meta", filename);
-    f = fopen(metadata_filename, "w");
-    if (!f) {
-        printf("Error: Cannot create metadata file\n");
-        free(buffer);
-        return -1;
-    }
-    
-    fprintf(f, "Recording Metadata:\n");
-    fprintf(f, "Sample Rate: %d Hz\n", SAMPLE_RATE);
-    fprintf(f, "Channels: %d\n", CHANNELS);
-    fprintf(f, "Duration: %d seconds\n", DURATION);
-    fprintf(f, "File Size: %ld bytes\n", file_size);
-    fprintf(f, "Peak Level: %.2f dB\n", 20 * log10(stats.peak_amplitude));
-    fprintf(f, "Average Level: %.2f dB\n", 20 * log10(stats.average_amplitude));
-    fprintf(f, "RMS Level: %.2f dB\n", 20 * log10(stats.rms_level));
-    fprintf(f, "Clipping Instances: %d\n", stats.clipping_count);
-    fclose(f);
-    printf("\nMetadata saved to %s\n", metadata_filename);
-    
-    // Playback verification with robust error handling
-    printf("\n=== Verifying Recording Playback ===\n");
-    snd_pcm_t *handle;
-    int err;
-    
-    if ((err = snd_pcm_open(&handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-        printf("Error: Playback open failed: %s\n", snd_strerror(err));
-        free(buffer);
-        return -1;
-    }
-    
-    // Set hardware parameters
-    snd_pcm_hw_params_t *params;
-    snd_pcm_hw_params_alloca(&params);
-    snd_pcm_hw_params_any(handle, params);
-    
-    // Configure parameters with error checking
-    if ((err = snd_pcm_hw_params_set_access(handle, params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
-        printf("Error setting access: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-    
-    if ((err = snd_pcm_hw_params_set_format(handle, params, SND_PCM_FORMAT_S16_LE)) < 0) {
-        printf("Error setting format: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-    
-    if ((err = snd_pcm_hw_params_set_channels(handle, params, CHANNELS)) < 0) {
-        printf("Error setting channels: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-    
-    unsigned int rate = SAMPLE_RATE;
-    if ((err = snd_pcm_hw_params_set_rate_near(handle, params, &rate, 0)) < 0) {
-        printf("Error setting rate: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-    
-    // Apply hardware parameters
-    if ((err = snd_pcm_hw_params(handle, params)) < 0) {
-        printf("Error setting hardware parameters: %s\n", snd_strerror(err));
-        goto cleanup;
-    }
-    
-    printf("Playing back recording...\n");
-    printf("Press Ctrl+C to stop playback\n");
-    
-    // Calculate frames
-    size_t frames = read_size / (CHANNELS * sizeof(int16_t));
-    size_t pos = 0;
-    size_t chunk_size = BUFFER_SIZE; // Use smaller chunks for smoother playback
-    
-    // Playback loop with progress indication
-    while (pos < frames) {
-        size_t frames_to_write = (frames - pos < chunk_size) ? frames - pos : chunk_size;
-        
-        err = snd_pcm_writei(handle, buffer + pos * CHANNELS, frames_to_write);
-        
-        if (err == -EPIPE) {
-            printf("Buffer underrun, recovering...\n");
-            snd_pcm_prepare(handle);
+    while (frames_left > 0) {
+        int err = snd_pcm_writei(handle, buf, frames_left);
+        if (err < 0) {
+            if ((err = xrun_recovery(handle, err)) < 0) {
+                fprintf(stderr, "Write error: %s\n", snd_strerror(err));
+                return err;
+            }
             continue;
-        } else if (err < 0) {
-            printf("Write error: %s\n", snd_strerror(err));
-            break;
         }
         
-        pos += err;
+        frames_left -= err;
+        buf += err * CHANNELS;
+    }
+    return 0;
+}
+
+// Function to safely read from PCM device
+static int read_pcm(snd_pcm_t *handle, short *buffer, snd_pcm_uframes_t frames) {
+    snd_pcm_uframes_t frames_left = frames;
+    short *buf = buffer;
+    
+    while (frames_left > 0) {
+        int err = snd_pcm_readi(handle, buf, frames_left);
+        if (err < 0) {
+            if ((err = xrun_recovery(handle, err)) < 0) {
+                fprintf(stderr, "Read error: %s\n", snd_strerror(err));
+                return err;
+            }
+            continue;
+        }
         
-        // Show progress
-        printf("\rPlayback progress: %.1f%%", (float)pos * 100 / frames);
-        fflush(stdout);
+        frames_left -= err;
+        buf += err * CHANNELS;
     }
-    
-    printf("\nPlayback completed!\n");
-    
-cleanup:
-    if (handle) {
-        snd_pcm_drain(handle);
-        snd_pcm_close(handle);
+    return 0;
+}
+
+// Function to generate white noise
+void generate_noise(short *buffer, size_t buffer_size, float volume) {
+    volume *= master_volume;  // Apply master volume
+    for (size_t i = 0; i < buffer_size / SAMPLE_SIZE; i++) {
+        float random = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
+        buffer[i] = (short)(random * volume * 32767.0f);
     }
-    free(buffer);
-    return (err < 0) ? -1 : 0;
+}
+
+// Function to process audio (simple amplification with volume control)
+void process_audio(short *buffer, size_t buffer_size, float gain) {
+    gain *= master_volume;  // Apply master volume
+    for (size_t i = 0; i < buffer_size / SAMPLE_SIZE; i++) {
+        float sample = buffer[i];
+        sample *= gain;
+        if (sample > 32767.0f) sample = 32767.0f;
+        if (sample < -32767.0f) sample = -32767.0f;
+        buffer[i] = (short)sample;
+    }
+}
+
+// Configure ALSA device
+static int configure_alsa(snd_pcm_t *handle, unsigned int rate, unsigned int channels) {
+    snd_pcm_hw_params_t *hw_params;
+    int err;
+
+    snd_pcm_hw_params_alloca(&hw_params);
+    
+    if ((err = snd_pcm_hw_params_any(handle, hw_params)) < 0) {
+        fprintf(stderr, "Cannot initialize hardware parameter structure: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_hw_params_set_access(handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED)) < 0) {
+        fprintf(stderr, "Cannot set access type: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_hw_params_set_format(handle, hw_params, SND_PCM_FORMAT_S16_LE)) < 0) {
+        fprintf(stderr, "Cannot set sample format: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_hw_params_set_channels(handle, hw_params, channels)) < 0) {
+        fprintf(stderr, "Cannot set channel count: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_hw_params_set_rate_near(handle, hw_params, &rate, 0)) < 0) {
+        fprintf(stderr, "Cannot set sample rate: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    // Set period size
+    snd_pcm_uframes_t period_size = PERIOD_SIZE;
+    if ((err = snd_pcm_hw_params_set_period_size_near(handle, hw_params, &period_size, 0)) < 0) {
+        fprintf(stderr, "Cannot set period size: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_hw_params(handle, hw_params)) < 0) {
+        fprintf(stderr, "Cannot set parameters: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    return 0;
+}
+
+// Function to set volume (0.0 to 1.0)
+void set_volume(float volume) {
+    if (volume < 0.0f) volume = 0.0f;
+    if (volume > 1.0f) volume = 1.0f;
+    master_volume = volume;
+    printf("Volume set to %.1f%%\n", volume * 100);
 }
 
 int main() {
-    printf("=== ALSA Audio Test Suite ===\n");
-    
-    // Initialize mixer with error checking
-    printf("\nInitializing mixer controls...\n");
-    if (setup_mixer_controls() < 0) {
-        printf("Failed to initialize mixer controls\n");
+    snd_pcm_t *playback_handle, *capture_handle;
+    int err;
+    short *buffer;
+
+    // Allocate buffer
+    buffer = (short *)malloc(BUFFER_SIZE);
+    if (!buffer) {
+        fprintf(stderr, "Buffer allocation failed\n");
         return 1;
     }
-    
-    // Test playback with error checking
-    printf("\nStarting playback test...\n");
-    if (test_playback() < 0) {
-        printf("Playback test failed\n");
+
+    // Open playback device
+    if ((err = snd_pcm_open(&playback_handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
+        fprintf(stderr, "Playback open error: %s\n", snd_strerror(err));
         return 1;
     }
-    
-    // Wait between tests
-    printf("\nWaiting 2 seconds before recording...\n");
-    sleep(2);
-    
-    // Test recording with error checking
-    const char *recording_file = "test_recording.raw";
-    printf("\nStarting recording test...\n");
-    if (test_recording(recording_file) < 0) {
-        printf("Recording test failed\n");
+
+    // Open capture device
+    if ((err = snd_pcm_open(&capture_handle, "default", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
+        fprintf(stderr, "Capture open error: %s\n", snd_strerror(err));
+        snd_pcm_close(playback_handle);
         return 1;
     }
-    
-    // Process and verify recording
-    printf("\nStarting recording verification...\n");
-    if (process_recording(recording_file) < 0) {
-        printf("Recording processing failed\n");
+
+    // Configure devices
+    if ((err = configure_alsa(playback_handle, RATE, CHANNELS)) < 0 ||
+        (err = configure_alsa(capture_handle, RATE, CHANNELS)) < 0) {
+        snd_pcm_close(playback_handle);
+        snd_pcm_close(capture_handle);
         return 1;
     }
+
+    // Set initial volume to 50%
+    set_volume(0.5f);
+
+    printf("Generating and playing noise...\n");
+    generate_noise(buffer, BUFFER_SIZE, 0.1f);
+    if ((err = write_pcm(playback_handle, buffer, RATE * SECONDS)) < 0) {
+        goto cleanup;
+    }
     
-    printf("\n=== Test Suite Complete ===\n");
-    printf("Files generated:\n");
-    printf("1. %s (Raw audio data)\n", recording_file);
-    printf("2. %s.meta (Recording metadata)\n", recording_file);
+    printf("Recording for 5 seconds...\n");
+    if ((err = read_pcm(capture_handle, buffer, RATE * SECONDS)) < 0) {
+        goto cleanup;
+    }
     
-    return 0;
+    // Increase volume for playback
+    set_volume(0.7f);
+    
+    printf("Processing and playing back recording...\n");
+    process_audio(buffer, BUFFER_SIZE, 1.2f);
+    if ((err = write_pcm(playback_handle, buffer, RATE * SECONDS)) < 0) {
+        goto cleanup;
+    }
+
+cleanup:
+    free(buffer);
+    snd_pcm_close(playback_handle);
+    snd_pcm_close(capture_handle);
+    
+    return err < 0 ? 1 : 0;
 }
