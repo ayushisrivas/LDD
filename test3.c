@@ -2,8 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#include <signal.h>
 #include <unistd.h>
+#include <time.h>
 
 #define RATE 44100
 #define CHANNELS 2
@@ -11,105 +11,162 @@
 #define SAMPLE_SIZE (sizeof(short))
 #define FRAME_SIZE (CHANNELS * SAMPLE_SIZE)
 #define BUFFER_SIZE (RATE * SECONDS * FRAME_SIZE)
-#define PERIOD_SIZE 4096
 
-// Previous functions remain the same until main()...
-[Previous functions remain exactly the same]
+// Generate white noise
+void generate_noise(short *buffer, size_t size, float volume) {
+    for (size_t i = 0; i < size/SAMPLE_SIZE; i++) {
+        float random = ((float)rand() / RAND_MAX) * 2.0f - 1.0f;
+        buffer[i] = (short)(random * volume * 32767.0f);
+    }
+}
+
+// Process audio with simple amplification
+void process_audio(short *buffer, size_t size, float gain) {
+    for (size_t i = 0; i < size/SAMPLE_SIZE; i++) {
+        float sample = buffer[i] * gain;
+        if (sample > 32767.0f) sample = 32767.0f;
+        if (sample < -32767.0f) sample = -32767.0f;
+        buffer[i] = (short)sample;
+    }
+}
+
+// Configure ALSA device
+int setup_alsa(snd_pcm_t **handle, char *device, snd_pcm_stream_t stream) {
+    int err;
+    snd_pcm_hw_params_t *hw_params;
+
+    if ((err = snd_pcm_open(handle, device, stream, 0)) < 0) {
+        fprintf(stderr, "Cannot open audio device %s: %s\n", device, snd_strerror(err));
+        return err;
+    }
+
+    snd_pcm_hw_params_alloca(&hw_params);
+    snd_pcm_hw_params_any(*handle, hw_params);
+    snd_pcm_hw_params_set_access(*handle, hw_params, SND_PCM_ACCESS_RW_INTERLEAVED);
+    snd_pcm_hw_params_set_format(*handle, hw_params, SND_PCM_FORMAT_S16_LE);
+    snd_pcm_hw_params_set_channels(*handle, hw_params, CHANNELS);
+    snd_pcm_hw_params_set_rate_near(*handle, hw_params, (unsigned int *)&RATE, 0);
+
+    if ((err = snd_pcm_hw_params(*handle, hw_params)) < 0) {
+        fprintf(stderr, "Cannot set parameters: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    if ((err = snd_pcm_prepare(*handle)) < 0) {
+        fprintf(stderr, "Cannot prepare audio interface: %s\n", snd_strerror(err));
+        return err;
+    }
+
+    return 0;
+}
+
+int play_buffer(snd_pcm_t *handle, short *buffer, int frames) {
+    int err;
+    while (frames > 0) {
+        err = snd_pcm_writei(handle, buffer, frames);
+        if (err == -EPIPE) {
+            snd_pcm_prepare(handle);
+            continue;
+        } else if (err < 0) {
+            fprintf(stderr, "Write error: %s\n", snd_strerror(err));
+            return err;
+        }
+        frames -= err;
+        buffer += err * CHANNELS;
+    }
+    return 0;
+}
+
+int record_buffer(snd_pcm_t *handle, short *buffer, int frames) {
+    int err;
+    while (frames > 0) {
+        err = snd_pcm_readi(handle, buffer, frames);
+        if (err == -EPIPE) {
+            snd_pcm_prepare(handle);
+            continue;
+        } else if (err < 0) {
+            fprintf(stderr, "Read error: %s\n", snd_strerror(err));
+            return err;
+        }
+        frames -= err;
+        buffer += err * CHANNELS;
+    }
+    return 0;
+}
 
 int main() {
-    snd_pcm_t *playback_handle, *capture_handle;
+    snd_pcm_t *playback_handle = NULL;
+    snd_pcm_t *capture_handle = NULL;
+    short *play_buffer_data;
+    short *capture_buffer_data;
     int err;
-    short *noise_buffer, *capture_buffer;
+
+    srand(time(NULL));
 
     // Allocate buffers
-    noise_buffer = (short *)malloc(BUFFER_SIZE);
-    capture_buffer = (short *)malloc(BUFFER_SIZE);
-    if (!noise_buffer || !capture_buffer) {
-        fprintf(stderr, "Buffer allocation failed\n");
-        return 1;
-    }
-    memset(capture_buffer, 0, BUFFER_SIZE);
-
-    // Open playback device
-    if ((err = snd_pcm_open(&playback_handle, "default", SND_PCM_STREAM_PLAYBACK, 0)) < 0) {
-        fprintf(stderr, "Playback open error: %s\n", snd_strerror(err));
+    play_buffer_data = malloc(BUFFER_SIZE);
+    capture_buffer_data = malloc(BUFFER_SIZE);
+    if (!play_buffer_data || !capture_buffer_data) {
+        fprintf(stderr, "Cannot allocate buffers\n");
         return 1;
     }
 
-    // Open capture device
-    if ((err = snd_pcm_open(&capture_handle, "default", SND_PCM_STREAM_CAPTURE, 0)) < 0) {
-        fprintf(stderr, "Capture open error: %s\n", snd_strerror(err));
-        snd_pcm_close(playback_handle);
-        return 1;
+    // First setup and use playback
+    if ((err = setup_alsa(&playback_handle, "default", SND_PCM_STREAM_PLAYBACK)) < 0) {
+        goto cleanup;
     }
 
-    // Configure devices
-    if ((err = configure_alsa(playback_handle, RATE, CHANNELS)) < 0 ||
-        (err = configure_alsa(capture_handle, RATE, CHANNELS)) < 0) {
-        snd_pcm_close(playback_handle);
-        snd_pcm_close(capture_handle);
-        return 1;
-    }
-
-    // Initial volume
-    set_volume(0.5f);
-
-    // Step 1: Generate and play noise
-    printf("Generating noise...\n");
-    generate_noise(noise_buffer, BUFFER_SIZE, 0.1f);
+    printf("Generating and playing noise...\n");
+    generate_noise(play_buffer_data, BUFFER_SIZE, 0.1f);
     
-    printf("Playing noise...\n");
-    snd_pcm_prepare(playback_handle);
-    if ((err = write_pcm(playback_handle, noise_buffer, RATE * SECONDS)) < 0) {
+    if ((err = play_buffer(playback_handle, play_buffer_data, RATE * SECONDS)) < 0) {
         goto cleanup;
     }
     
-    // Ensure playback is complete
+    // Make sure playback is complete
     snd_pcm_drain(playback_handle);
+    snd_pcm_close(playback_handle);
+    playback_handle = NULL;
     
-    // Small delay to ensure complete drain
-    usleep(100000);  // 100ms delay
-
-    // Step 2: Record
-    printf("Starting recording...\n");
-    // Drop any old data
-    snd_pcm_drop(capture_handle);
-    // Prepare for new capture
-    snd_pcm_prepare(capture_handle);
-    
-    // Start the actual recording
-    if ((err = read_pcm(capture_handle, capture_buffer, RATE * SECONDS)) < 0) {
-        fprintf(stderr, "Recording failed: %s\n", snd_strerror(err));
+    // Now setup and use capture
+    printf("Setting up recording...\n");
+    if ((err = setup_alsa(&capture_handle, "default", SND_PCM_STREAM_CAPTURE)) < 0) {
         goto cleanup;
     }
-    
-    printf("Recording complete.\n");
-    
-    // Ensure capture is complete
+
+    printf("Recording for 5 seconds...\n");
+    if ((err = record_buffer(capture_handle, capture_buffer_data, RATE * SECONDS)) < 0) {
+        goto cleanup;
+    }
+
+    // Close capture device
     snd_pcm_drain(capture_handle);
-    
-    // Step 3: Playback the recording
-    printf("Playing back recording...\n");
-    set_volume(0.7f);
-    process_audio(capture_buffer, BUFFER_SIZE, 1.2f);
-    
-    // Prepare for playback
-    snd_pcm_drop(playback_handle);
-    snd_pcm_prepare(playback_handle);
-    
-    if ((err = write_pcm(playback_handle, capture_buffer, RATE * SECONDS)) < 0) {
+    snd_pcm_close(capture_handle);
+    capture_handle = NULL;
+
+    // Reopen playback for recorded audio
+    if ((err = setup_alsa(&playback_handle, "default", SND_PCM_STREAM_PLAYBACK)) < 0) {
         goto cleanup;
     }
+
+    printf("Playing back recording...\n");
+    process_audio(capture_buffer_data, BUFFER_SIZE, 1.2f);
     
-    // Wait for final playback to complete
-    snd_pcm_drain(playback_handle);
-    printf("Playback complete.\n");
+    if ((err = play_buffer(playback_handle, capture_buffer_data, RATE * SECONDS)) < 0) {
+        goto cleanup;
+    }
 
 cleanup:
-    free(noise_buffer);
-    free(capture_buffer);
-    snd_pcm_close(playback_handle);
-    snd_pcm_close(capture_handle);
-    
+    if (playback_handle) {
+        snd_pcm_drain(playback_handle);
+        snd_pcm_close(playback_handle);
+    }
+    if (capture_handle) {
+        snd_pcm_drain(capture_handle);
+        snd_pcm_close(capture_handle);
+    }
+    free(play_buffer_data);
+    free(capture_buffer_data);
+
     return err < 0 ? 1 : 0;
 }
