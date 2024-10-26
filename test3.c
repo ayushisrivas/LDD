@@ -5,13 +5,12 @@
 #include <unistd.h>
 #include <time.h>
 
-#define RATE 44100
 #define CHANNELS 2
 #define SECONDS 5
 #define SAMPLE_SIZE (sizeof(short))
 #define FRAME_SIZE (CHANNELS * SAMPLE_SIZE)
 #define BUFFER_SIZE (RATE * SECONDS * FRAME_SIZE)
-
+const unsigned int RATE= 44100;
 // Generate white noise
 void generate_noise(short *buffer, size_t size, float volume) {
     for (size_t i = 0; i < size/SAMPLE_SIZE; i++) {
