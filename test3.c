@@ -158,11 +158,12 @@ void set_volume(float volume) {
 int main() {
     snd_pcm_t *playback_handle, *capture_handle;
     int err;
-    short *buffer;
+    short *buffer, *capture_buffer;
 
-    // Allocate buffer
+    // Allocate buffers
     buffer = (short *)malloc(BUFFER_SIZE);
-    if (!buffer) {
+    capture_buffer = (short *)malloc(BUFFER_SIZE);
+    if (!buffer || !capture_buffer) {
         fprintf(stderr, "Buffer allocation failed\n");
         return 1;
     }
@@ -196,9 +197,15 @@ int main() {
     if ((err = write_pcm(playback_handle, buffer, RATE * SECONDS)) < 0) {
         goto cleanup;
     }
+
+    // Wait for playback to complete
+    snd_pcm_drain(playback_handle);
     
     printf("Recording for 5 seconds...\n");
-    if ((err = read_pcm(capture_handle, buffer, RATE * SECONDS)) < 0) {
+    // Prepare capture
+    snd_pcm_prepare(capture_handle);
+    
+    if ((err = read_pcm(capture_handle, capture_buffer, RATE * SECONDS)) < 0) {
         goto cleanup;
     }
     
@@ -206,13 +213,21 @@ int main() {
     set_volume(0.7f);
     
     printf("Processing and playing back recording...\n");
-    process_audio(buffer, BUFFER_SIZE, 1.2f);
-    if ((err = write_pcm(playback_handle, buffer, RATE * SECONDS)) < 0) {
+    process_audio(capture_buffer, BUFFER_SIZE, 1.2f);
+    
+    // Prepare playback
+    snd_pcm_prepare(playback_handle);
+    
+    if ((err = write_pcm(playback_handle, capture_buffer, RATE * SECONDS)) < 0) {
         goto cleanup;
     }
+    
+    // Wait for final playback to complete
+    snd_pcm_drain(playback_handle);
 
 cleanup:
     free(buffer);
+    free(capture_buffer);
     snd_pcm_close(playback_handle);
     snd_pcm_close(capture_handle);
     
